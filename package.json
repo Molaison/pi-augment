@@ -1,0 +1,33 @@
+{
+  "name": "pi-augment",
+  "version": "0.3.0",
+  "description": "Persistent conversational cache-epoch prompt augmentation for Pi",
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prompt-enhancer",
+    "openai-codex",
+    "prompt-cache"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT"
+}
