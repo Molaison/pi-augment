@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -31,6 +31,12 @@ const SENTINEL_CLOSE = "</pi-augment>";
 const PARENT_WAIT_TIMEOUT_MS = 120_000;
 const SIDE_REQUEST_TIMEOUT_MS = 45_000;
 const ESCAPE = "\x1b";
+const NANO_CONTEXT_USAGE_EVENT = "nano-context:usage";
+const NANO_CONTEXT_USAGE_ENTRY_TYPE = "nano-context.usage";
+const NANO_CONTEXT_USAGE_SOURCE = "pi-augment/side";
+const NANO_CONTEXT_LISTENER_STATE_KEY = Symbol.for(
+  "nano-context.usage-listeners",
+);
 
 type JsonRecord = Record<string, unknown>;
 type DebugData = Record<string, unknown>;
@@ -60,6 +66,21 @@ interface AugmentResult {
   turn: number;
   restored: boolean;
   rotatedReason?: string;
+}
+
+interface NanoContextUsageRecord {
+  version: 1;
+  id: string;
+  source: typeof NANO_CONTEXT_USAGE_SOURCE;
+  sessionId: string;
+  timestamp: number;
+  usage: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    cost: number;
+  };
 }
 
 class AugmentCancelledError extends Error {}
@@ -227,6 +248,7 @@ async function augmentFromCurrentContext(
 
   const sideModel = resolveObservationalMemoryModel(ctx);
   const modelLabel = `${sideModel.provider}/${sideModel.id}`;
+  assertNanoContextUsageListener();
   const beforeSession = sessionInvariant(ctx);
   const prepared = preparePersistentSideTurn(pi, ctx, sideModel, draft);
   assertParentSessionUnchanged(ctx, beforeSession);
@@ -298,6 +320,7 @@ async function augmentFromCurrentContext(
   );
 
   if (!submitted) throw new Error("provider 未构建 side payload。");
+  persistNanoContextUsage(pi, ctx, parentSessionId, response);
   throwIfAborted(signal);
   assertParentSessionUnchanged(ctx, beforeSession);
   reportStage("4/5 校验增强结果", {
@@ -318,6 +341,61 @@ async function augmentFromCurrentContext(
     restored: prepared.restored,
     rotatedReason: prepared.rotatedReason,
   };
+}
+
+function assertNanoContextUsageListener(): void {
+  const state = (globalThis as unknown as Record<symbol, unknown>)[
+    NANO_CONTEXT_LISTENER_STATE_KEY
+  ];
+  if (!state) {
+    throw new Error(
+      "Nano Context usage listener 未激活；未启动会产生未记账费用的 side 请求。",
+    );
+  }
+}
+
+function persistNanoContextUsage(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  parentSessionId: string,
+  response: AssistantMessage,
+): void {
+  const usage = response.usage;
+  const record: NanoContextUsageRecord = {
+    version: 1,
+    id: randomUUID(),
+    source: NANO_CONTEXT_USAGE_SOURCE,
+    sessionId: parentSessionId,
+    timestamp: response.timestamp,
+    usage: {
+      input: usage.input,
+      output: usage.output,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      cost: usage.cost.total,
+    },
+  };
+  pi.events.emit(NANO_CONTEXT_USAGE_EVENT, record);
+  const persisted = ctx.sessionManager.getEntries().some((entry) => {
+    if (
+      entry.type !== "custom" ||
+      entry.customType !== NANO_CONTEXT_USAGE_ENTRY_TYPE ||
+      !isRecord(entry.data)
+    ) {
+      return false;
+    }
+    return (
+      entry.data.version === 1 &&
+      entry.data.id === record.id &&
+      entry.data.source === record.source &&
+      entry.data.sessionId === parentSessionId
+    );
+  });
+  if (!persisted) {
+    throw new Error(
+      "Nano Context 未持久化本次 side usage；结果未提交，拒绝静默漏记费用。",
+    );
+  }
 }
 
 function resolveObservationalMemoryModel(

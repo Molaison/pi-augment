@@ -33,11 +33,13 @@ Epoch 创建时读取 Observational Memory V3 ledger：
 
 ## 持久恢复
 
-插件将 epoch 状态写入 `pi-augment.side-epoch.v1` custom entries：
+插件将 epoch 状态写入 `pi-augment.side-epoch.v1` custom entries。customType 为兼容已有 epoch 保持不变；新记录使用 compact event `version: 2`：
 
-- `created`：冻结 summary、coverage、模型、模板和 side identity；
-- `turn`：parent delta、draft、完整 accepted side assistant 与 usage；
+- `created`：结构化持久一次 summary、coverage、模型、模板、side identity 和 parent system；恢复时重建 seed message 及可派生 hash，不再双重 JSON 编码大字段；
+- `turn`：结构化持久一次 parent delta 与 draft，并保留完整 accepted side assistant；恢复时确定性重建 user message，不再重复存储 epoch/turn/boundary/source IDs；
 - `closed`：epoch 轮换原因。
+
+有效 event `version: 1` 会原样恢复，并可在同一 epoch、同一 side cache identity 后直接追加 version 2 turn；不会为布局升级强制冷启动。未知 version、损坏字段或不连续 boundary 会明确失败，不跳过、不截断。
 
 普通 Pi `CustomEntry` 不参与 `buildSessionContext()`，所以这些数据会进入 session JSONL 并跨 `/reload`、Pi 重启和 session restore 保留，但不会进入父 LLM context。插件每次调用都从活动 branch 重建并严格校验连续 turn 序号和 parent source 边界。
 
@@ -89,7 +91,7 @@ Footer 显示：
 - side provider 请求最长 45 秒；
 - `Esc` 只取消当前 Augment，不调用 `ctx.abort()`；
 - 同一时刻只允许一个 Augment；
-- provider 失败、取消、invalid sentinel、tool call 或意外 reasoning 都不会提交 `turn`。
+- provider 失败或取消不会提交 `turn`；若 provider 已返回真实 usage，即使随后因 invalid sentinel、tool call 或意外 reasoning 拒绝结果，usage 仍会记入 Nano Context External。
 
 调试模式：
 
@@ -98,6 +100,17 @@ pi --augment-debug
 ```
 
 stderr 的 `[pi-augment:debug]` JSON 行包含 epoch hash、side identity hash、turn、是否恢复、轮换原因、parent delta 条目数、payload items/bytes 和 usage；不记录 prompt、summary、draft、assistant 文本或 API key。
+
+## Nano Context External usage
+
+`/augment` 要求当前 session 已激活 Nano Context usage listener。每次 provider 返回后，插件从真实 `AssistantMessage.usage` 发出兼容的 `nano-context:usage` event：
+
+- `source=pi-augment/side`；
+- `sessionId` 为父 Pi session；
+- `input/output/cacheRead/cacheWrite/cost` 原样取自 provider usage；
+- Nano Context 负责持久化为 `nano-context.usage` custom entry、去重并刷新 footer `External`。
+
+插件会确认对应 usage entry 已实际持久化；listener 未激活时在 provider 调用前明确失败，持久化失败时不提交 side turn。它不会伪造 usage，也不会写父会话可见 message。usage custom entry 与 side epoch entry 都不属于 `om.*`。
 
 ## Cache 与 provider 路由
 
@@ -132,6 +145,6 @@ Side identity 永不等于父 session/cache identity，因而不会显式绑定�
 
 - 连续语义以 epoch 为界，轮换后开始新 side 对话；
 - 其他扩展只在 provider hook 中瞬时改写、但未写入 session source entries 的内容不会进入 parent delta；
-- side usage 由 provider 计量，但插件不写 `nano-context.usage`，因此不会进入 Nano Context `External`；
-- custom state 会增加 session JSONL 大小，但不会增加父模型上下文；
+- side usage 由 provider 计量并通过 Nano Context 的既有 event/persistence 协议进入 `External`；
+- compact event version 2 减少 session JSONL 重复与双重编码，但冻结上下文和连续 transcript 仍会占用磁盘，不会增加父模型上下文；
 - 客户端只能保持稳定 cache identity 和前缀，不能保证 OpenAI 必然返回 cache hit。

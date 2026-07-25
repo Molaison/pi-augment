@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 export const SIDE_EPOCH_CUSTOM_TYPE = "pi-augment.side-epoch.v1";
+export const SIDE_EVENT_VERSION = 2;
 export const SIDE_TEMPLATE_VERSION = 1;
 export const SIDE_OUTPUT_RESERVE_TOKENS = 8_192;
 
@@ -75,8 +76,10 @@ interface EpochModel {
   api: string;
 }
 
+type SideEventVersion = 1 | typeof SIDE_EVENT_VERSION;
+
 interface EpochCreatedEvent {
-  version: 1;
+  version: SideEventVersion;
   kind: "created";
   epochId: string;
   sideSessionId: string;
@@ -93,7 +96,7 @@ interface EpochCreatedEvent {
 }
 
 interface EpochTurnEvent {
-  version: 1;
+  version: SideEventVersion;
   kind: "turn";
   epochId: string;
   turn: number;
@@ -106,7 +109,7 @@ interface EpochTurnEvent {
 }
 
 interface EpochClosedEvent {
-  version: 1;
+  version: SideEventVersion;
   kind: "closed";
   epochId: string;
   reason: string;
@@ -114,6 +117,49 @@ interface EpochClosedEvent {
 }
 
 type EpochEvent = EpochCreatedEvent | EpochTurnEvent | EpochClosedEvent;
+
+interface CompactCreatedRecord {
+  version: typeof SIDE_EVENT_VERSION;
+  kind: "created";
+  epochId: string;
+  sideSessionId: string;
+  parentSessionId: string;
+  model: EpochModel;
+  templateVersion: number;
+  templateHash: string;
+  coverageEntryId: string;
+  parentSystemPrompt: string;
+  summary: string;
+  seedTimestamp: number;
+  createdAt: number;
+}
+
+interface CompactParentDelta {
+  afterEntryId: string;
+  throughEntryId: string;
+  sourceEntryIds: string[];
+  conversation: string;
+}
+
+interface CompactTurnRecord {
+  version: typeof SIDE_EVENT_VERSION;
+  kind: "turn";
+  epochId: string;
+  turn: number;
+  parentDelta: CompactParentDelta;
+  draft: string;
+  userTimestamp: number;
+  assistantMessage: AssistantMessage;
+  committedAt: number;
+}
+
+interface CompactClosedRecord {
+  version: typeof SIDE_EVENT_VERSION;
+  kind: "closed";
+  epochId: string;
+  reason: string;
+  closedAt: number;
+}
 
 export interface SideEpochState {
   created: EpochCreatedEvent;
@@ -128,6 +174,8 @@ export interface PreparedSideTurn {
   fromParentEntryId: string;
   throughParentEntryId: string;
   parentSourceEntryIds: string[];
+  parentDeltaConversation: string;
+  draft: string;
   turn: number;
   restored: boolean;
   rotatedReason?: string;
@@ -229,20 +277,36 @@ export function commitPersistentSideTurn(
   prepared: PreparedSideTurn,
   assistantMessage: AssistantMessage,
 ): void {
-  const event: EpochTurnEvent = {
-    version: 1,
+  const committedAt = Date.now();
+  const record: CompactTurnRecord = {
+    version: SIDE_EVENT_VERSION,
     kind: "turn",
     epochId: prepared.epoch.created.epochId,
     turn: prepared.turn,
-    fromParentEntryId: prepared.fromParentEntryId,
-    throughParentEntryId: prepared.throughParentEntryId,
-    parentSourceEntryIds: prepared.parentSourceEntryIds,
+    parentDelta: {
+      afterEntryId: prepared.fromParentEntryId,
+      throughEntryId: prepared.throughParentEntryId,
+      sourceEntryIds: prepared.parentSourceEntryIds,
+      conversation: prepared.parentDeltaConversation,
+    },
+    draft: prepared.draft,
+    userTimestamp: prepared.userMessage.timestamp,
+    assistantMessage,
+    committedAt,
+  };
+  pi.appendEntry(SIDE_EPOCH_CUSTOM_TYPE, record);
+  prepared.epoch.turns.push({
+    version: SIDE_EVENT_VERSION,
+    kind: "turn",
+    epochId: record.epochId,
+    turn: record.turn,
+    fromParentEntryId: record.parentDelta.afterEntryId,
+    throughParentEntryId: record.parentDelta.throughEntryId,
+    parentSourceEntryIds: record.parentDelta.sourceEntryIds,
     userMessage: prepared.userMessage,
     assistantMessage,
-    committedAt: Date.now(),
-  };
-  pi.appendEntry(SIDE_EPOCH_CUSTOM_TYPE, event);
-  prepared.epoch.turns.push(event);
+    committedAt,
+  });
 }
 
 export function sideEpochDebugData(prepared: PreparedSideTurn): JsonRecord {
@@ -263,6 +327,9 @@ export function sideEpochDebugData(prepared: PreparedSideTurn): JsonRecord {
     rotatedReason: prepared.rotatedReason,
     parentDeltaEntries: prepared.parentSourceEntryIds.length,
     estimatedInputTokens: prepared.estimatedInputTokens,
+    restoredStorageVersion:
+      prepared.epoch.turns.at(-1)?.version ?? prepared.epoch.created.version,
+    nextStorageVersion: SIDE_EVENT_VERSION,
   };
 }
 
@@ -276,20 +343,17 @@ function buildPreparedTurn(
   const fromParentEntryId = latestParentBoundary(epoch);
   const delta = collectParentDelta(branch, fromParentEntryId);
   const turn = epoch.turns.length + 1;
-  const user = userMessage(
-    JSON.stringify({
-      type: "pi-augment-side-turn",
-      version: 1,
-      epochId: epoch.created.epochId,
-      turn,
-      parentDelta: {
-        afterEntryId: fromParentEntryId,
-        throughEntryId: delta.throughEntryId,
-        sourceEntryIds: delta.sourceEntryIds,
-        conversation: delta.text,
-      },
-      draft,
-    }),
+  const parentDelta: CompactParentDelta = {
+    afterEntryId: fromParentEntryId,
+    throughEntryId: delta.throughEntryId,
+    sourceEntryIds: delta.sourceEntryIds,
+    conversation: delta.text,
+  };
+  const user = sideTurnUserMessage(
+    epoch.created.epochId,
+    turn,
+    parentDelta,
+    draft,
   );
   const messages = [
     epoch.created.seedMessage,
@@ -303,6 +367,8 @@ function buildPreparedTurn(
     fromParentEntryId,
     throughParentEntryId: delta.throughEntryId,
     parentSourceEntryIds: delta.sourceEntryIds,
+    parentDeltaConversation: delta.text,
+    draft,
     turn,
     restored,
     rotatedReason,
@@ -321,41 +387,55 @@ function createEpoch(
   const snapshot = buildOmSnapshot(branch);
   const epochId = randomUUID();
   const sideSessionId = randomUUID();
-  const seedMessage = userMessage(
-    JSON.stringify({
-      type: "pi-augment-side-epoch",
-      version: 1,
-      epochId,
-      parentSystemPrompt,
-      observationalMemory: {
-        summary: snapshot.summary,
-        summaryHash: snapshot.summaryHash,
-        coversUpToId: snapshot.coverageEntryId,
-      },
-    }),
+  const seedTimestamp = Date.now();
+  const seedMessage = sideEpochSeedMessage(
+    epochId,
+    parentSystemPrompt,
+    snapshot.summary,
+    snapshot.coverageEntryId,
+    seedTimestamp,
   );
-  const created: EpochCreatedEvent = {
-    version: 1,
+  const createdAt = Date.now();
+  const model: EpochModel = {
+    provider: sideModel.provider,
+    id: sideModel.id,
+    api: sideModel.api,
+  };
+  const record: CompactCreatedRecord = {
+    version: SIDE_EVENT_VERSION,
     kind: "created",
     epochId,
     sideSessionId,
-    promptCacheKey: sideSessionId,
     parentSessionId,
-    model: {
-      provider: sideModel.provider,
-      id: sideModel.id,
-      api: sideModel.api,
-    },
+    model,
     templateVersion: SIDE_TEMPLATE_VERSION,
     templateHash: hashValue(SIDE_SYSTEM_PROMPT),
-    parentSystemHash,
-    summaryHash: snapshot.summaryHash,
     coverageEntryId: snapshot.coverageEntryId,
-    seedMessage,
-    createdAt: Date.now(),
+    parentSystemPrompt,
+    summary: snapshot.summary,
+    seedTimestamp,
+    createdAt,
   };
-  pi.appendEntry(SIDE_EPOCH_CUSTOM_TYPE, created);
-  return { created, turns: [] };
+  pi.appendEntry(SIDE_EPOCH_CUSTOM_TYPE, record);
+  return {
+    created: {
+      version: SIDE_EVENT_VERSION,
+      kind: "created",
+      epochId,
+      sideSessionId,
+      promptCacheKey: sideSessionId,
+      parentSessionId,
+      model,
+      templateVersion: record.templateVersion,
+      templateHash: record.templateHash,
+      parentSystemHash,
+      summaryHash: snapshot.summaryHash,
+      coverageEntryId: snapshot.coverageEntryId,
+      seedMessage,
+      createdAt,
+    },
+    turns: [],
+  };
 }
 
 function closeEpoch(
@@ -363,8 +443,8 @@ function closeEpoch(
   epoch: SideEpochState,
   reason: string,
 ): void {
-  const event: EpochClosedEvent = {
-    version: 1,
+  const event: CompactClosedRecord = {
+    version: SIDE_EVENT_VERSION,
     kind: "closed",
     epochId: epoch.created.epochId,
     reason,
@@ -646,22 +726,36 @@ function contextLimitError(
 }
 
 function parseEpochEvent(value: unknown): EpochEvent {
-  if (
-    !isRecord(value) ||
-    value.version !== 1 ||
-    typeof value.kind !== "string"
-  ) {
+  if (!isRecord(value) || typeof value.kind !== "string") {
     throw new Error("side epoch custom entry 格式无效。");
   }
-  if (value.kind === "created" && isCreatedEvent(value)) return value;
-  if (value.kind === "turn" && isTurnEvent(value)) return value;
-  if (value.kind === "closed" && isClosedEvent(value)) return value;
-  throw new Error("side epoch custom entry 内容无效。");
+  if (value.version === 1) {
+    if (value.kind === "created" && isLegacyCreatedEvent(value)) return value;
+    if (value.kind === "turn" && isLegacyTurnEvent(value)) return value;
+    if (value.kind === "closed" && isClosedRecord(value)) return value;
+    throw new Error("side epoch version 1 custom entry 内容无效。");
+  }
+  if (value.version === SIDE_EVENT_VERSION) {
+    if (value.kind === "created") {
+      const event = parseCompactCreatedRecord(value);
+      if (event) return event;
+    }
+    if (value.kind === "turn") {
+      const event = parseCompactTurnRecord(value);
+      if (event) return event;
+    }
+    if (value.kind === "closed" && isClosedRecord(value)) return value;
+    throw new Error("side epoch version 2 custom entry 内容无效。");
+  }
+  throw new Error(
+    `side epoch event version=${String(value.version)} 不受支持。`,
+  );
 }
 
-function isCreatedEvent(value: unknown): value is EpochCreatedEvent {
+function isLegacyCreatedEvent(value: unknown): value is EpochCreatedEvent {
   if (!isRecord(value)) return false;
   return (
+    value.version === 1 &&
     hasStrings(value, [
       "epochId",
       "sideSessionId",
@@ -683,9 +777,10 @@ function isCreatedEvent(value: unknown): value is EpochCreatedEvent {
   );
 }
 
-function isTurnEvent(value: unknown): value is EpochTurnEvent {
+function isLegacyTurnEvent(value: unknown): value is EpochTurnEvent {
   if (!isRecord(value)) return false;
   return (
+    value.version === 1 &&
     value.kind === "turn" &&
     hasStrings(value, [
       "epochId",
@@ -696,19 +791,132 @@ function isTurnEvent(value: unknown): value is EpochTurnEvent {
     (value.turn as number) > 0 &&
     Array.isArray(value.parentSourceEntryIds) &&
     value.parentSourceEntryIds.every(isNonEmptyString) &&
-    ((value.parentSourceEntryIds.length === 0 &&
-      value.throughParentEntryId === value.fromParentEntryId) ||
-      (value.parentSourceEntryIds.length > 0 &&
-        value.parentSourceEntryIds.at(-1) === value.throughParentEntryId)) &&
+    validParentBoundary(
+      value.fromParentEntryId as string,
+      value.throughParentEntryId as string,
+      value.parentSourceEntryIds as string[],
+    ) &&
     isMessage(value.userMessage, "user") &&
     isMessage(value.assistantMessage, "assistant") &&
     typeof value.committedAt === "number"
   );
 }
 
-function isClosedEvent(value: unknown): value is EpochClosedEvent {
+function parseCompactCreatedRecord(
+  value: JsonRecord,
+): EpochCreatedEvent | undefined {
+  if (
+    value.version !== SIDE_EVENT_VERSION ||
+    value.kind !== "created" ||
+    !hasStrings(value, [
+      "epochId",
+      "sideSessionId",
+      "parentSessionId",
+      "templateHash",
+      "coverageEntryId",
+      "parentSystemPrompt",
+      "summary",
+    ]) ||
+    value.sideSessionId === value.parentSessionId ||
+    !Number.isInteger(value.templateVersion) ||
+    (value.templateVersion as number) <= 0 ||
+    typeof value.seedTimestamp !== "number" ||
+    typeof value.createdAt !== "number" ||
+    !isEpochModel(value.model)
+  ) {
+    return undefined;
+  }
+  const summaryHash = hashValue(value.summary);
+  return {
+    version: SIDE_EVENT_VERSION,
+    kind: "created",
+    epochId: value.epochId as string,
+    sideSessionId: value.sideSessionId as string,
+    promptCacheKey: value.sideSessionId as string,
+    parentSessionId: value.parentSessionId as string,
+    model: value.model,
+    templateVersion: value.templateVersion as number,
+    templateHash: value.templateHash as string,
+    parentSystemHash: hashValue(value.parentSystemPrompt),
+    summaryHash,
+    coverageEntryId: value.coverageEntryId as string,
+    seedMessage: sideEpochSeedMessage(
+      value.epochId as string,
+      value.parentSystemPrompt as string,
+      value.summary as string,
+      value.coverageEntryId as string,
+      value.seedTimestamp,
+    ),
+    createdAt: value.createdAt,
+  };
+}
+
+function parseCompactTurnRecord(value: JsonRecord): EpochTurnEvent | undefined {
+  if (
+    value.version !== SIDE_EVENT_VERSION ||
+    value.kind !== "turn" ||
+    !hasStrings(value, ["epochId", "draft"]) ||
+    !Number.isInteger(value.turn) ||
+    (value.turn as number) <= 0 ||
+    typeof value.userTimestamp !== "number" ||
+    typeof value.committedAt !== "number" ||
+    !isMessage(value.assistantMessage, "assistant") ||
+    !isCompactParentDelta(value.parentDelta)
+  ) {
+    return undefined;
+  }
+  return {
+    version: SIDE_EVENT_VERSION,
+    kind: "turn",
+    epochId: value.epochId as string,
+    turn: value.turn as number,
+    fromParentEntryId: value.parentDelta.afterEntryId,
+    throughParentEntryId: value.parentDelta.throughEntryId,
+    parentSourceEntryIds: value.parentDelta.sourceEntryIds,
+    userMessage: sideTurnUserMessage(
+      value.epochId as string,
+      value.turn as number,
+      value.parentDelta,
+      value.draft as string,
+      value.userTimestamp,
+    ),
+    assistantMessage: value.assistantMessage as AssistantMessage,
+    committedAt: value.committedAt,
+  };
+}
+
+function isCompactParentDelta(value: unknown): value is CompactParentDelta {
+  if (
+    !isRecord(value) ||
+    !hasStrings(value, ["afterEntryId", "throughEntryId"]) ||
+    typeof value.conversation !== "string" ||
+    !Array.isArray(value.sourceEntryIds) ||
+    !value.sourceEntryIds.every(isNonEmptyString)
+  ) {
+    return false;
+  }
+  return validParentBoundary(
+    value.afterEntryId as string,
+    value.throughEntryId as string,
+    value.sourceEntryIds as string[],
+  );
+}
+
+function validParentBoundary(
+  fromEntryId: string,
+  throughEntryId: string,
+  sourceEntryIds: string[],
+): boolean {
+  return (
+    (sourceEntryIds.length === 0 && throughEntryId === fromEntryId) ||
+    (sourceEntryIds.length > 0 && sourceEntryIds.at(-1) === throughEntryId)
+  );
+}
+
+function isClosedRecord(value: unknown): value is EpochClosedEvent {
   if (!isRecord(value)) return false;
   return (
+    (value.version === 1 || value.version === SIDE_EVENT_VERSION) &&
     value.kind === "closed" &&
     hasStrings(value, ["epochId", "reason"]) &&
     typeof value.closedAt === "number"
@@ -826,11 +1034,54 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function userMessage(text: string): Message {
+function sideEpochSeedMessage(
+  epochId: string,
+  parentSystemPrompt: string,
+  summary: string,
+  coverageEntryId: string,
+  timestamp = Date.now(),
+): Message {
+  return userMessage(
+    JSON.stringify({
+      type: "pi-augment-side-epoch",
+      version: 1,
+      epochId,
+      parentSystemPrompt,
+      observationalMemory: {
+        summary,
+        summaryHash: hashValue(summary),
+        coversUpToId: coverageEntryId,
+      },
+    }),
+    timestamp,
+  );
+}
+
+function sideTurnUserMessage(
+  epochId: string,
+  turn: number,
+  parentDelta: CompactParentDelta,
+  draft: string,
+  timestamp = Date.now(),
+): Message {
+  return userMessage(
+    JSON.stringify({
+      type: "pi-augment-side-turn",
+      version: 1,
+      epochId,
+      turn,
+      parentDelta,
+      draft,
+    }),
+    timestamp,
+  );
+}
+
+function userMessage(text: string, timestamp = Date.now()): Message {
   return {
     role: "user",
     content: [{ type: "text", text }],
-    timestamp: Date.now(),
+    timestamp,
   };
 }
 
