@@ -22,11 +22,19 @@ export const SIDE_OUTPUT_RESERVE_TOKENS = 8_192;
 const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
 const OM_REFLECTIONS_RECORDED = "om.reflections.recorded";
 const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
+const OM_LEDGER_TYPES = new Set([
+  OM_OBSERVATIONS_RECORDED,
+  OM_REFLECTIONS_RECORDED,
+  OM_OBSERVATIONS_DROPPED,
+]);
 const SOURCE_ENTRY_TYPES = new Set([
   "message",
   "custom_message",
   "branch_summary",
 ]);
+const EMPTY_PARENT_ROOT = "pi-augment:empty-parent-root:v1";
+const EMPTY_PARENT_CONTEXT_DESCRIPTION =
+  "No parent source entries existed when this side epoch was created.";
 const MEMORY_ID_PATTERN = /^[a-f0-9]{12}$/;
 const RELEVANCE_VALUES = new Set(["low", "medium", "high", "critical"]);
 
@@ -326,6 +334,9 @@ export function sideEpochDebugData(prepared: PreparedSideTurn): JsonRecord {
     restored: prepared.restored,
     rotatedReason: prepared.rotatedReason,
     parentDeltaEntries: prepared.parentSourceEntryIds.length,
+    contextMode: isEmptyParentBootstrap(prepared.epoch.created)
+      ? "empty-parent"
+      : "observational-memory",
     estimatedInputTokens: prepared.estimatedInputTokens,
     restoredStorageVersion:
       prepared.epoch.turns.at(-1)?.version ?? prepared.epoch.created.version,
@@ -384,7 +395,7 @@ function createEpoch(
   parentSystemHash: string,
   sideModel: Model<Api>,
 ): SideEpochState {
-  const snapshot = buildOmSnapshot(branch);
+  const snapshot = buildEpochSnapshot(branch);
   const epochId = randomUUID();
   const sideSessionId = randomUUID();
   const seedTimestamp = Date.now();
@@ -531,10 +542,38 @@ function epochCompatibilityFailure(
     return "parent_system_changed";
   }
   const ids = new Set(branch.map((entry) => entry.id));
-  if (!ids.has(created.coverageEntryId)) return "om_coverage_left_branch";
-  if (!ids.has(latestParentBoundary(epoch)))
+  const emptyBootstrap = isEmptyParentBootstrap(created);
+  if (!emptyBootstrap && !ids.has(created.coverageEntryId))
+    return "om_coverage_left_branch";
+  const latestBoundary = latestParentBoundary(epoch);
+  if (latestBoundary !== EMPTY_PARENT_ROOT && !ids.has(latestBoundary))
     return "parent_boundary_left_branch";
   return undefined;
+}
+
+function isEmptyParentBootstrap(created: EpochCreatedEvent): boolean {
+  return (
+    created.version === SIDE_EVENT_VERSION &&
+    created.coverageEntryId === EMPTY_PARENT_ROOT &&
+    created.summaryHash === hashValue(EMPTY_PARENT_CONTEXT_DESCRIPTION)
+  );
+}
+
+function buildEpochSnapshot(branch: SessionEntry[]): OmSnapshot {
+  const hasParentSource = branch.some((entry) =>
+    SOURCE_ENTRY_TYPES.has(entry.type),
+  );
+  const hasOmLedger = branch.some(
+    (entry) => entry.type === "custom" && OM_LEDGER_TYPES.has(entry.customType),
+  );
+  if (!hasParentSource && !hasOmLedger) {
+    return {
+      summary: EMPTY_PARENT_CONTEXT_DESCRIPTION,
+      summaryHash: hashValue(EMPTY_PARENT_CONTEXT_DESCRIPTION),
+      coverageEntryId: EMPTY_PARENT_ROOT,
+    };
+  }
+  return buildOmSnapshot(branch);
 }
 
 function buildOmSnapshot(branch: SessionEntry[]): OmSnapshot {
@@ -608,8 +647,11 @@ function collectParentDelta(
   branch: SessionEntry[],
   afterEntryId: string,
 ): ParentDelta {
-  const boundaryIndex = branch.findIndex((entry) => entry.id === afterEntryId);
-  if (boundaryIndex < 0)
+  const boundaryIndex =
+    afterEntryId === EMPTY_PARENT_ROOT
+      ? -1
+      : branch.findIndex((entry) => entry.id === afterEntryId);
+  if (boundaryIndex < 0 && afterEntryId !== EMPTY_PARENT_ROOT)
     throw new Error("side epoch parent source 边界不在当前 branch。 ");
   const sourceEntries = branch
     .slice(boundaryIndex + 1)
@@ -824,6 +866,10 @@ function parseCompactCreatedRecord(
     typeof value.createdAt !== "number" ||
     !isEpochModel(value.model)
   ) {
+    return undefined;
+  }
+  const emptyBootstrap = value.coverageEntryId === EMPTY_PARENT_ROOT;
+  if (emptyBootstrap && value.summary !== EMPTY_PARENT_CONTEXT_DESCRIPTION) {
     return undefined;
   }
   const summaryHash = hashValue(value.summary);
@@ -1041,17 +1087,29 @@ function sideEpochSeedMessage(
   coverageEntryId: string,
   timestamp = Date.now(),
 ): Message {
+  const context =
+    coverageEntryId === EMPTY_PARENT_ROOT
+      ? {
+          emptyParentContext: {
+            description: summary,
+            sourceEntryCountAtCreation: 0,
+            rootBoundary: coverageEntryId,
+          },
+        }
+      : {
+          observationalMemory: {
+            summary,
+            summaryHash: hashValue(summary),
+            coversUpToId: coverageEntryId,
+          },
+        };
   return userMessage(
     JSON.stringify({
       type: "pi-augment-side-epoch",
       version: 1,
       epochId,
       parentSystemPrompt,
-      observationalMemory: {
-        summary,
-        summaryHash: hashValue(summary),
-        coversUpToId: coverageEntryId,
-      },
+      ...context,
     }),
     timestamp,
   );

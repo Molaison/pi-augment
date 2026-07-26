@@ -7,7 +7,7 @@
 ```text
 固定 side system prompt
 + 冻结 parent system prompt
-+ 冻结 Observational Memory summary
++ 冻结 Observational Memory summary（真正空会话则为显式 empty-parent root）
 + 第 1 轮 parent 原始尾部与 draft
 + 第 1 轮 side assistant
 + 第 2 轮新增 parent 尾部与 draft
@@ -29,13 +29,17 @@ Epoch 创建时读取 Observational Memory V3 ledger：
 
 插件冻结当前 reflections + active observations，并以最新有效 observation `coversUpToId` 为边界。边界之后的 `message`、`custom_message` 和 `branch_summary` 作为未压缩原始尾部；后续调用只追加上次边界之后的新 source entries。
 
-若当前 branch 没有可解析的 OM summary 或 `coversUpToId`，插件会明确失败，不静默退回完整父会话或短摘要。
+首次新开会话即使已有 `model_change` 等设置 entry，只要还没有任何 `message`、`custom_message`、`branch_summary`，且没有任何 OM ledger entry，插件会建立显式 empty-parent bootstrap epoch：其概念根边界固定为 `pi-augment:empty-parent-root:v1`，seed 标记 `emptyParentContext`，第一轮 parent delta 为空。它不是 OM summary，不写 `om.*`，也不读取另一套 fallback 上下文；后续轮次继续同一 side epoch，出现真实 parent source entries 后会从该概念根收集并转入普通真实 entry 边界。
+
+Pi core 对全新 session 会把首次 JSONL flush 延迟到正常 parent assistant message 出现。此前 empty-parent side events 可跨 `/reload` 保持，但若直接终止整个 Pi 进程，尚无磁盘 session 可供恢复；插件不会为了强制落盘而写入父消息。第一个正常 parent turn 完成后，Pi 会把先前 side custom events 一并持久化，之后的进程重启/session restore 继续恢复同一 epoch。
+
+若已有任何 parent source entry 却没有可解析的 OM summary/`coversUpToId`，插件仍明确失败，不静默退回完整父会话或短摘要。没有 source entry 但已出现 OM ledger 的不一致状态也明确失败。
 
 ## 持久恢复
 
 插件将 epoch 状态写入 `pi-augment.side-epoch.v1` custom entries。customType 为兼容已有 epoch 保持不变；新记录使用 compact event `version: 2`：
 
-- `created`：结构化持久一次 summary、coverage、模型、模板、side identity 和 parent system；恢复时重建 seed message 及可派生 hash，不再双重 JSON 编码大字段；
+- `created`：结构化持久一次 summary 或 empty-parent 描述、coverage/概念根、模型、模板、side identity 和 parent system；恢复时重建 seed message 及可派生 hash，不再双重 JSON 编码大字段；
 - `turn`：结构化持久一次 parent delta 与 draft，并保留完整 accepted side assistant；恢复时确定性重建 user message，不再重复存储 epoch/turn/boundary/source IDs；
 - `closed`：epoch 轮换原因。
 
@@ -146,5 +150,6 @@ Side identity 永不等于父 session/cache identity，因而不会显式绑定�
 - 连续语义以 epoch 为界，轮换后开始新 side 对话；
 - 其他扩展只在 provider hook 中瞬时改写、但未写入 session source entries 的内容不会进入 parent delta；
 - side usage 由 provider 计量并通过 Nano Context 的既有 event/persistence 协议进入 `External`；
+- empty-parent bootstrap 只支持真正没有 parent source entries 且没有 OM ledger 的首次启动；“已有历史但 OM 尚未覆盖”仍不支持并显式失败；
 - compact event version 2 减少 session JSONL 重复与双重编码，但冻结上下文和连续 transcript 仍会占用磁盘，不会增加父模型上下文；
 - 客户端只能保持稳定 cache identity 和前缀，不能保证 OpenAI 必然返回 cache hit。
