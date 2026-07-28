@@ -35,6 +35,7 @@ const SOURCE_ENTRY_TYPES = new Set([
 const EMPTY_PARENT_ROOT = "pi-augment:empty-parent-root:v1";
 const EMPTY_PARENT_CONTEXT_DESCRIPTION =
   "No parent source entries existed when this side epoch was created.";
+const EMPTY_PARENT_SYSTEM_PROMPT = "";
 const MEMORY_ID_PATTERN = /^[a-f0-9]{12}$/;
 const RELEVANCE_VALUES = new Set(["low", "medium", "high", "critical"]);
 
@@ -396,12 +397,19 @@ function createEpoch(
   sideModel: Model<Api>,
 ): SideEpochState {
   const snapshot = buildEpochSnapshot(branch);
+  const emptyParentBootstrap = snapshot.coverageEntryId === EMPTY_PARENT_ROOT;
+  const frozenParentSystemPrompt = emptyParentBootstrap
+    ? EMPTY_PARENT_SYSTEM_PROMPT
+    : parentSystemPrompt;
+  const frozenParentSystemHash = emptyParentBootstrap
+    ? hashValue(EMPTY_PARENT_SYSTEM_PROMPT)
+    : parentSystemHash;
   const epochId = randomUUID();
   const sideSessionId = randomUUID();
   const seedTimestamp = Date.now();
   const seedMessage = sideEpochSeedMessage(
     epochId,
-    parentSystemPrompt,
+    frozenParentSystemPrompt,
     snapshot.summary,
     snapshot.coverageEntryId,
     seedTimestamp,
@@ -422,7 +430,7 @@ function createEpoch(
     templateVersion: SIDE_TEMPLATE_VERSION,
     templateHash: hashValue(SIDE_SYSTEM_PROMPT),
     coverageEntryId: snapshot.coverageEntryId,
-    parentSystemPrompt,
+    parentSystemPrompt: frozenParentSystemPrompt,
     summary: snapshot.summary,
     seedTimestamp,
     createdAt,
@@ -439,7 +447,7 @@ function createEpoch(
       model,
       templateVersion: record.templateVersion,
       templateHash: record.templateHash,
-      parentSystemHash,
+      parentSystemHash: frozenParentSystemHash,
       summaryHash: snapshot.summaryHash,
       coverageEntryId: snapshot.coverageEntryId,
       seedMessage,
@@ -538,11 +546,21 @@ function epochCompatibilityFailure(
   ) {
     return "side_template_changed";
   }
-  if (created.parentSystemHash !== parentSystemHash) {
+  const emptyBootstrap = isEmptyParentBootstrap(created);
+  const branchHasNoParentSource = !branch.some((entry) =>
+    SOURCE_ENTRY_TYPES.has(entry.type),
+  );
+  if (
+    emptyBootstrap &&
+    branchHasNoParentSource &&
+    created.parentSystemHash !== hashValue(EMPTY_PARENT_SYSTEM_PROMPT)
+  ) {
+    return "empty_parent_system_prompt_present";
+  }
+  if (!emptyBootstrap && created.parentSystemHash !== parentSystemHash) {
     return "parent_system_changed";
   }
   const ids = new Set(branch.map((entry) => entry.id));
-  const emptyBootstrap = isEmptyParentBootstrap(created);
   if (!emptyBootstrap && !ids.has(created.coverageEntryId))
     return "om_coverage_left_branch";
   const latestBoundary = latestParentBoundary(epoch);
@@ -856,9 +874,9 @@ function parseCompactCreatedRecord(
       "parentSessionId",
       "templateHash",
       "coverageEntryId",
-      "parentSystemPrompt",
       "summary",
     ]) ||
+    typeof value.parentSystemPrompt !== "string" ||
     value.sideSessionId === value.parentSessionId ||
     !Number.isInteger(value.templateVersion) ||
     (value.templateVersion as number) <= 0 ||
@@ -1103,12 +1121,17 @@ function sideEpochSeedMessage(
             coversUpToId: coverageEntryId,
           },
         };
+  const parentSystemContext =
+    coverageEntryId === EMPTY_PARENT_ROOT &&
+    parentSystemPrompt === EMPTY_PARENT_SYSTEM_PROMPT
+      ? {}
+      : { parentSystemPrompt };
   return userMessage(
     JSON.stringify({
       type: "pi-augment-side-epoch",
       version: 1,
       epochId,
-      parentSystemPrompt,
+      ...parentSystemContext,
       ...context,
     }),
     timestamp,
